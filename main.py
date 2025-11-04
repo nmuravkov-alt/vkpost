@@ -6,7 +6,6 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.filters import CommandStart
-from dateutil import parser as dateparser
 
 import vk_api
 from vk_api.upload import VkUpload
@@ -18,27 +17,62 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 VK_GROUP_ID = int(os.getenv("VK_GROUP_ID", "0"))        # ID сообщества БЕЗ минуса
 VK_TOKEN = os.getenv("VK_TOKEN", "")
-VK_CATEGORY_ID = int(os.getenv("VK_CATEGORY_ID", "0"))  # обязателен для market.add
+VK_CATEGORY_ID = int(os.getenv("VK_CATEGORY_ID", "0"))  # дефолтная категория, если не указано в посте
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
 POST_TIMES = os.getenv("POST_TIMES", "14:00,18:00")
 
-if not BOT_TOKEN or not VK_TOKEN or not VK_GROUP_ID or not VK_CATEGORY_ID:
-    print("❗Заполните .env: BOT_TOKEN, VK_TOKEN, VK_GROUP_ID, VK_CATEGORY_ID")
+# albums mapping: "бомберы:111111,куртки:222222"
+ALBUMS = os.getenv("ALBUMS", "")
 
-# ----------------------- TG -----------------------
+def parse_times(s: str):
+    times = []
+    for t in s.split(","):
+        t = t.strip()
+        if not t: continue
+        h, m = t.split(":")
+        times.append((int(h), int(m)))
+    return times
+
+def parse_albums_map(s: str):
+    m = {}
+    for pair in filter(None, [x.strip() for x in s.split(",")]):
+        if ":" not in pair: 
+            continue
+        k, v = [p.strip() for p in pair.split(":", 1)]
+        if v.isdigit():
+            m[k.lower()] = int(v)
+    return m
+
+ALBUM_MAP = parse_albums_map(ALBUMS)
+
+# ----------------------- TG / VK -----------------------
 bot = Bot(BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 
-# ----------------------- VK -----------------------
 vk_session = vk_api.VkApi(token=VK_TOKEN)
 vk = vk_session.get_api()
 uploader = VkUpload(vk_session)
 
-# ----------------------- Parsing -----------------------
+# ----------------------- Regex -----------------------
 PRICE_RE = re.compile(r'(?i)(?:^|[\n\r])\s*(?:цена|price)\s*:\s*([\d\s.,]+)')
 SIZES_RE = re.compile(r'(?i)(?:^|[\n\r])\s*(?:размеры|sizes)\s*:\s*(.+)')
 SKU_RE   = re.compile(r'(?i)(?:^|[\n\r])\s*(?:артикул|sku)\s*:\s*([#\w\-]+)')
 
+CAT_RE   = re.compile(r'(?i)(?:^|\n)\s*(?:категория|category|cat)\s*:\s*([#\w\- ]+)')
+CAT_TAG  = re.compile(r'#cat[_\-]?(\d+)', re.I)
+
+ALBUM_RE = re.compile(r'(?i)(?:^|\n)\s*(?:подборка|album|подкатегория)\s*:\s*([#\w ,\-]+)')
+ALB_TAG  = re.compile(r'#alb[_\-]?(\d+)', re.I)
+
+CATEGORY_MAP = {
+    "men": 2, "муж": 2, "мужское": 2,
+    "women": 1, "жен": 1, "женское": 1,
+    "kids": 3, "дет": 3,
+    "shoes": 4, "обув": 4, "bags": 4, "сумк": 4,
+    "access": 5, "аксесс": 5,
+}
+
+# ----------------------- Parsing -----------------------
 def parse_product(text: str):
     lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
     title = lines[0] if lines else "Без названия"
@@ -60,16 +94,46 @@ def parse_product(text: str):
     m = SKU_RE.search(text or "")
     if m: sku = m.group(1).lstrip("#")
 
-    # Описание: весь текст без первой строки и служебных полей
+    # description
     desc_lines = []
     for ln in (text or "").splitlines()[1:]:
         low = ln.lower()
-        if any(k in low for k in ["цена:", "price:", "размер", "sizes:", "артикул", "sku:"]):
+        if any(k in low for k in ["цена:", "price:", "размер", "sizes:", "артикул", "sku:", "категория:", "category:", "подборка:", "album:"]):
             continue
         desc_lines.append(ln)
     description = "\n".join(desc_lines).strip() or title
 
-    return {"title": title, "price": price, "sizes": sizes, "sku": sku, "description": description}
+    # category
+    category_id = None
+    m = CAT_RE.search(text or "")
+    if m:
+        key = m.group(1).strip().lower()
+        if key.isdigit():
+            category_id = int(key)
+        else:
+            for k, v in CATEGORY_MAP.items():
+                if k in key:
+                    category_id = v
+                    break
+    m = CAT_TAG.search(text or "")
+    if m:
+        category_id = int(m.group(1))
+
+    # albums
+    album_ids = []
+    m = ALBUM_RE.search(text or "")
+    if m:
+        tokens = [t.strip().lower() for t in re.split(r'[,\s]+', m.group(1)) if t.strip()]
+        for t in tokens:
+            if t.isdigit():
+                album_ids.append(int(t))
+            elif t in ALBUM_MAP:
+                album_ids.append(ALBUM_MAP[t])
+    for m in ALB_TAG.finditer(text or ""):
+        album_ids.append(int(m.group(1)))
+
+    return {"title": title, "price": price, "sizes": sizes, "sku": sku, "description": description,
+            "category_id": category_id, "album_ids": album_ids}
 
 def build_description_for_vk(p):
     parts = [p.get("description") or p["title"]]
@@ -78,13 +142,12 @@ def build_description_for_vk(p):
     if p.get("price") is not None: parts.append(f"Цена: {int(p['price'])} ₽")
     return "\n".join(parts)
 
-# ----------------------- Helpers -----------------------
+# ----------------------- Media helpers -----------------------
 async def download_tg_file(file_id: str, bot_token: str) -> str:
     f = await bot.get_file(file_id)
     url = f"https://api.telegram.org/file/bot{bot_token}/{f.file_path}"
     r = requests.get(url, timeout=60)
     r.raise_for_status()
-    import tempfile, os
     fd, path = tempfile.mkstemp(suffix=".jpg")
     os.write(fd, r.content)
     os.close(fd)
@@ -94,12 +157,19 @@ def upload_market_main_photo(path: str) -> int:
     saved = uploader.photo_market(photos=path, group_id=VK_GROUP_ID, main_photo=True)
     return saved[0]["id"]
 
+def upload_wall_photo(path: str) -> str:
+    res = uploader.photo_wall([path], group_id=VK_GROUP_ID)
+    p = res[0]
+    return f"photo{p['owner_id']}_{p['id']}"
+
+# ----------------------- VK actions -----------------------
 def create_vk_product(data, main_photo_id: int):
+    cat_id = data.get("category_id") or VK_CATEGORY_ID
     resp = vk.market.add(
         owner_id = -VK_GROUP_ID,
         name = data["title"][:100],
         description = build_description_for_vk(data),
-        category_id = VK_CATEGORY_ID,
+        category_id = cat_id,
         price = int(data["price"] or 0),
         main_photo_id = main_photo_id,
         sku = data["sku"] or "",
@@ -109,25 +179,12 @@ def create_vk_product(data, main_photo_id: int):
     url = f"https://vk.com/market-{VK_GROUP_ID}?w=product-{VK_GROUP_ID}_{item_id}"
     return (-VK_GROUP_ID, item_id, url)
 
-def parse_times(s: str):
-    times = []
-    for t in s.split(","):
-        t = t.strip()
-        if not t: continue
-        h, m = t.split(":")
-        times.append((int(h), int(m)))
-    return times
-
-def next_day_at(hour: int, minute: int, tzname: str) -> datetime:
-    tz = ZoneInfo(tzname)
-    now = datetime.now(tz)
-    dt = (now + timedelta(days=1)).replace(hour=hour, minute=minute, second=0, microsecond=0)
-    return dt
-
-def upload_wall_photo(path: str) -> str:
-    res = uploader.photo_wall([path], group_id=VK_GROUP_ID)
-    p = res[0]
-    return f"photo{p['owner_id']}_{p['id']}"
+def add_to_albums(item_id: int, album_ids: list[int]):
+    if not album_ids: return
+    try:
+        vk.market.addToAlbum(owner_id=-VK_GROUP_ID, item_id=item_id, album_ids=",".join(map(str, album_ids)))
+    except Exception as e:
+        print("addToAlbum error:", e)
 
 def schedule_wall_post(message_text: str, when_dt: datetime, attachments: str = "") -> int:
     publish_ts = int(when_dt.timestamp())
@@ -140,26 +197,33 @@ def schedule_wall_post(message_text: str, when_dt: datetime, attachments: str = 
     )
     return resp.get("post_id")
 
+def next_day_at(hour: int, minute: int, tzname: str) -> datetime:
+    tz = ZoneInfo(tzname)
+    now = datetime.now(tz)
+    dt = (now + timedelta(days=1)).replace(hour=hour, minute=minute, second=0, microsecond=0)
+    return dt
+
 # ----------------------- Bot flow -----------------------
 @dp.message(CommandStart())
 async def start(m: Message):
     await m.answer(
-        "Я превращаю ваше сообщение (фото + текст) в товар ВК и делаю два отложенных поста на завтра в 14:00 и 18:00.\n\n"
-        "Отправьте одно сообщение с фото и текстом вида:\n"
-        "<code>MA-1 bomber\nЦена: 5500 ₽\nАртикул: MA1-BLK\nРазмеры: S/M/L/XL\n\nСостояние: новое</code>\n\n"
-        "Потом выберите: «Создать товар ВК» или «Отложить посты ВК».")
+        "Я создаю карточку товара ВК и делаю два отложенных поста на завтра.\n\n"
+        "Формат (фото + текст):\n"
+        "<code>MA-1 bomber\nЦена: 5500 ₽\nАртикул: MA1-BLK\nРазмеры: S/M/L/XL\nКатегория: men  # или 2, или #cat2\nПодборка: бомберы, #alb123456\n\nОписание...</code>"
+    )
 
 @dp.message(F.photo | F.caption | F.text)
 async def handle_message(m: Message):
     text = m.caption or m.text or ""
-    if not text.strip():
-        return
+    if not text.strip(): return
     product = parse_product(text)
 
     preview = (f"<b>{product['title']}</b>\n"
                f"Цена: {int(product['price']) if product['price'] is not None else '—'} ₽\n"
-               f"{('Размеры: ' + product['sizes']) if product.get('sizes') else ''}\n"
-               f"{('Артикул: ' + product['sku']) if product.get('sku') else ''}\n\n"
+               f"{('Размеры: ' + (product['sizes'] or '')) if product.get('sizes') else ''}\n"
+               f"{('Артикул: ' + product['sku']) if product.get('sku') else ''}\n"
+               f"{('Категория: ' + str(product.get('category_id'))) if product.get('category_id') else ''}\n"
+               f"{('Подборки: ' + ','.join(map(str, product.get('album_ids', [])))) if product.get('album_ids') else ''}\n\n"
                f"{product['description']}")
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[
@@ -184,6 +248,7 @@ async def cb_add_product(cq: CallbackQuery):
     try:
         main_id = upload_market_main_photo(path)
         owner_id, item_id, url = create_vk_product(product, main_id)
+        add_to_albums(item_id, product.get("album_ids") or [])
     finally:
         try: os.remove(path)
         except: pass
@@ -212,9 +277,8 @@ async def cb_schedule_posts(cq: CallbackQuery):
             try: os.remove(path)
             except: pass
 
-    times = parse_times(POST_TIMES)
     urls = []
-    for h, mnt in times:
+    for h, mnt in parse_times(POST_TIMES):
         when = next_day_at(h, mnt, TIMEZONE)
         post_id = schedule_wall_post(post_text, when, attachments=attachment)
         urls.append((when, f"https://vk.com/wall-{VK_GROUP_ID}_{post_id}"))
