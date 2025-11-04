@@ -1,4 +1,3 @@
-
 import os, re, asyncio, tempfile, requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -6,6 +5,8 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.filters import CommandStart
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 
 import vk_api
 from vk_api.upload import VkUpload
@@ -46,7 +47,8 @@ def parse_albums_map(s: str):
 ALBUM_MAP = parse_albums_map(ALBUMS)
 
 # ----------------------- TG / VK -----------------------
-bot = Bot(BOT_TOKEN, parse_mode="HTML")
+# ⬇️ NEW: aiogram 3.7+ — parse_mode задаём через default=DefaultBotProperties(...)
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 vk_session = vk_api.VkApi(token=VK_TOKEN)
