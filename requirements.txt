@@ -1,0 +1,5 @@
+aiogram==3.*
+vk-api
+python-dotenv
+python-dateutil
+requests
